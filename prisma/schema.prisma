@@ -1,0 +1,40 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Cliente {
+  id         String   @id @default(uuid())
+  nome       String
+  cpf        String   @unique
+  email      String
+  celular    String
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+  Pedido     Pedido[]
+}
+
+model Pedido {
+  id         String       @id @default(uuid())
+  cliente_id String?
+  status     String
+  preco      Float
+  created_at DateTime     @default(now())
+  updated_at DateTime     @updatedAt
+  itens      ItemPedido[]
+  cliente    Cliente?     @relation(fields: [cliente_id], references: [id])
+}
+
+model ItemPedido {
+  id             String  @id @default(uuid())
+  pedido_id      String
+  produto_id     String  // This will store the product ID from the product service, but no foreign key constraint
+  quantidade     Int
+  preco_unitario Float
+  observacao     String?
+  pedido         Pedido  @relation(fields: [pedido_id], references: [id])
+} 

@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # Order API
+  order-api:
+    container_name: tech-order-api
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    ports:
+      - '3000:3000'
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@order-postgres:5432/order_db
+      - PRODUCT_API_URL=http://localhost:3001
+      - PAYMENT_API_URL=http://localhost:3002
+      - RABBITMQ_URI=amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672
+    depends_on:
+      - order-postgres
+      - rabbitmq
+    restart: unless-stopped
+
+  # PostgreSQL Database for Order Service
+  order-postgres:
+    container_name: order-postgres
+    image: postgres:16-alpine
+    ports:
+      - '5432:5432'
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: order_db
+    volumes:
+      - order_postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # RabbitMQ Message Broker
+  rabbitmq:
+    container_name: order-rabbitmq
+    image: rabbitmq:3-management-alpine
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    restart: unless-stopped
+
+volumes:
+  order_postgres_data:
+  rabbitmq_data: 
