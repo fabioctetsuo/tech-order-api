@@ -1,0 +1,74 @@
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        default: 'orders-service'
+        type: string
+      deployment_name:
+        description: 'Deployment name to rollback'
+        required: true
+        default: 'tech-order-api'
+        type: string
+      revision:
+        description: 'Revision number to rollback to (leave empty for previous revision)'
+        required: false
+        type: string
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: us-east-1
+        
+    - name: Update kube config
+      run: aws eks update-kubeconfig --region us-east-1 --name tech_challenge_cluster
+      
+    - name: Show current deployment status
+      run: |
+        echo "📊 Current deployment status:"
+        kubectl get deployment ${{ inputs.deployment_name }} -n ${{ inputs.namespace }} -o wide
+        echo ""
+        echo "📋 Deployment history:"
+        kubectl rollout history deployment/${{ inputs.deployment_name }} -n ${{ inputs.namespace }}
+        
+    - name: Rollback deployment
+      run: |
+        if [ -n "${{ inputs.revision }}" ]; then
+          echo "🔄 Rolling back to revision ${{ inputs.revision }}..."
+          kubectl rollout undo deployment/${{ inputs.deployment_name }} -n ${{ inputs.namespace }} --to-revision=${{ inputs.revision }}
+        else
+          echo "🔄 Rolling back to previous revision..."
+          kubectl rollout undo deployment/${{ inputs.deployment_name }} -n ${{ inputs.namespace }}
+        fi
+        
+    - name: Wait for rollback to complete
+      run: |
+        echo "⏳ Waiting for rollback to complete..."
+        kubectl rollout status deployment/${{ inputs.deployment_name }} -n ${{ inputs.namespace }} --timeout=300s
+        
+    - name: Show rollback status
+      run: |
+        echo "✅ Rollback completed successfully!"
+        echo ""
+        echo "📊 Updated deployment status:"
+        kubectl get deployment ${{ inputs.deployment_name }} -n ${{ inputs.namespace }} -o wide
+        echo ""
+        echo "📋 Updated deployment history:"
+        kubectl rollout history deployment/${{ inputs.deployment_name }} -n ${{ inputs.namespace }}
+        echo ""
+        echo "🐳 Pod status:"
+        kubectl get pods -n ${{ inputs.namespace }} -l app=${{ inputs.deployment_name }} 

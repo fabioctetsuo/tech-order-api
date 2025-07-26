@@ -1,0 +1,214 @@
+name: Manual Deploy to AWS
+
+on:
+  workflow_dispatch:
+    inputs:
+      docker_image:
+        description: 'Docker image to deploy (e.g., username/tech-order-api:latest)'
+        required: true
+        default: '${{ github.repository }}:latest'
+        type: string
+      database_url:
+        description: 'Database URL (optional - will be retrieved from AWS RDS if not provided)'
+        required: false
+        type: string
+      rabbitmq_uri:
+        description: 'RabbitMQ URI (optional - will use default if not provided)'
+        required: false
+        type: string
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        default: 'orders-service'
+        type: string
+      replicas:
+        description: 'Number of replicas'
+        required: false
+        default: '2'
+        type: string
+
+env:
+  REGISTRY: docker.io
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: us-east-1
+        
+    - name: Update kube config
+      run: aws eks update-kubeconfig --region us-east-1 --name tech_challenge_cluster
+      
+    - name: Verify cluster access
+      run: |
+        kubectl cluster-info
+        kubectl get nodes
+        
+    - name: Create or update namespace
+      run: |
+        kubectl create namespace ${{ inputs.namespace }} --dry-run=client -o yaml | kubectl apply -f -
+        
+    - name: Create or update ConfigMap
+      run: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: tech-order-api-config
+          namespace: ${{ inputs.namespace }}
+        data:
+          NODE_ENV: "${{ inputs.environment }}"
+          SERVICE_PORT: "3000"
+          PRODUCT_API_URL: "http://tech-product-api-service.products-service.svc.cluster.local:3001"
+          PAYMENT_API_URL: "http://tech-payment-api-service.payments-service.svc.cluster.local:3002"
+        EOF
+        
+    - name: Get database URL from AWS RDS
+      id: database-url
+      run: |
+        # Use provided database URL or get dynamically from AWS RDS
+        if [ -n "${{ inputs.database_url }}" ]; then
+          echo "database_url=${{ inputs.database_url }}" >> $GITHUB_OUTPUT
+          echo "✅ Using provided database URL"
+        else
+          # Get database URL dynamically from AWS RDS
+          echo "🔍 Getting database URL from AWS RDS..."
+          
+          # Get RDS instance details (dynamic parts)
+          RDS_ENDPOINT=$(aws rds describe-db-instances \
+            --db-instance-identifier tech-challenge-orders-db \
+            --query 'DBInstances[0].Endpoint.Address' \
+            --output text \
+            --region us-east-1)
+          
+          RDS_PORT=$(aws rds describe-db-instances \
+            --db-instance-identifier tech-challenge-orders-db \
+            --query 'DBInstances[0].Endpoint.Port' \
+            --output text \
+            --region us-east-1)
+          
+          # Get credentials from GitHub secrets (static parts)
+          DB_USERNAME="${{ secrets.DB_USERNAME }}"
+          DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
+          DB_NAME="${{ secrets.DB_NAME }}"
+          
+          # Verify GitHub secrets are set
+          if [ -z "$DB_USERNAME" ] || [ -z "$DB_PASSWORD" ] || [ -z "$DB_NAME" ]; then
+            echo "❌ Missing required GitHub secrets!"
+            echo "Please set the following secrets in your GitHub repository:"
+            echo "  - DB_USERNAME"
+            echo "  - DB_PASSWORD" 
+            echo "  - DB_NAME"
+            exit 1
+          fi
+          
+          # Construct the database URL
+          DATABASE_URL="postgresql://${DB_USERNAME}:${DB_PASSWORD}@${RDS_ENDPOINT}:${RDS_PORT}/${DB_NAME}"
+          
+          echo "database_url=$DATABASE_URL" >> $GITHUB_OUTPUT
+          echo "✅ Database URL retrieved dynamically from AWS RDS"
+          echo "Endpoint: $RDS_ENDPOINT"
+          echo "Port: $RDS_PORT"
+          echo "Database: $DB_NAME"
+        fi
+        
+    - name: Set RabbitMQ URI
+      id: rabbitmq-uri
+      run: |
+        # Use provided RabbitMQ URI or default
+        if [ -n "${{ inputs.rabbitmq_uri }}" ]; then
+          echo "rabbitmq_uri=${{ inputs.rabbitmq_uri }}" >> $GITHUB_OUTPUT
+          echo "✅ Using provided RabbitMQ URI"
+        else
+          RABBITMQ_URI="amqp://guest:guest@rabbitmq-service.orders-service.svc.cluster.local:5672"
+          echo "rabbitmq_uri=$RABBITMQ_URI" >> $GITHUB_OUTPUT
+          echo "✅ Using default RabbitMQ URI"
+        fi
+        
+    - name: Deploy RabbitMQ
+      run: |
+        echo "🚀 Deploying RabbitMQ..."
+        
+        # Apply RabbitMQ resources
+        kubectl apply -f k8s/rabbitmq-secret.yaml
+        kubectl apply -f k8s/rabbitmq-pvc.yaml
+        kubectl apply -f k8s/rabbitmq-deployment.yaml
+        kubectl apply -f k8s/rabbitmq-service.yaml
+        
+        # Wait for RabbitMQ to be ready
+        echo "⏳ Waiting for RabbitMQ to be ready..."
+        kubectl wait --for=condition=ready pod -l app=rabbitmq -n ${{ inputs.namespace }} --timeout=300s
+        
+        echo "✅ RabbitMQ deployed successfully"
+        
+    - name: Create or update Secret
+      run: |
+        kubectl create secret generic tech-order-api-secret \
+          --from-literal=DATABASE_URL="${{ steps.database-url.outputs.database_url }}" \
+          --from-literal=RABBITMQ_URI="${{ steps.rabbitmq-uri.outputs.rabbitmq_uri }}" \
+          --namespace=${{ inputs.namespace }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+        
+    - name: Run database migrations
+      run: |
+        # Generate migration job
+        export DOCKER_IMAGE="${{ inputs.docker_image }}"
+        envsubst < k8s/migration-job.yaml > k8s/migration-job-generated.yaml
+        
+        # Apply migration job
+        kubectl apply -f k8s/migration-job-generated.yaml
+        
+        # Wait for migration job to complete
+        echo "Waiting for migration job to complete..."
+        kubectl wait --for=condition=complete job/tech-order-api-migration -n ${{ inputs.namespace }} --timeout=300s
+        
+        # Clean up migration job
+        kubectl delete -f k8s/migration-job-generated.yaml
+        
+    - name: Deploy to Kubernetes
+      run: |
+        # Generate Kubernetes manifests
+        export DOCKER_IMAGE="${{ inputs.docker_image }}"
+        export REPLICAS="${{ inputs.replicas }}"
+        
+        envsubst < k8s/deployment.yaml.template > k8s/deployment.yaml
+        envsubst < k8s/service.yaml.template > k8s/service.yaml
+        
+        # Apply manifests
+        kubectl apply -f k8s/deployment.yaml
+        kubectl apply -f k8s/service.yaml
+        kubectl apply -f k8s/hpa.yaml
+        
+        # Wait for deployment to be ready
+        kubectl rollout status deployment/tech-order-api -n ${{ inputs.namespace }} --timeout=300s
+        
+    - name: Show deployment status
+      run: |
+        echo "🎉 Deployment completed successfully!"
+        echo ""
+        echo "Deployment Status:"
+        kubectl get pods -n ${{ inputs.namespace }}
+        echo ""
+        echo "Services:"
+        kubectl get services -n ${{ inputs.namespace }}
+        echo ""
+        echo "HPA:"
+        kubectl get hpa -n ${{ inputs.namespace }} 

@@ -1,0 +1,504 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+        
+    - name: Install dependencies and fix Prisma issues
+      run: |
+        # Use the Prisma fix script to handle installation issues
+        ./scripts/fix-prisma.sh fix
+      
+    # - name: Run linting
+    #   run: npm run lint
+      
+    # - name: Run tests
+    #   run: npm test
+      
+    - name: Build application
+      run: npm run build
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_ACCESS_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: us-east-1
+        
+    - name: Update kube config
+      run: aws eks update-kubeconfig --region us-east-1 --name tech_challenge_cluster
+      
+    - name: Get database URL from AWS RDS
+      id: database-url
+      run: |
+        # Get database URL dynamically from AWS RDS
+        echo "🔍 Getting database URL from AWS RDS..."
+        
+        # Get RDS instance details (dynamic parts)
+        RDS_ENDPOINT=$(aws rds describe-db-instances \
+          --db-instance-identifier tech-challenge-orders-db \
+          --query 'DBInstances[0].Endpoint.Address' \
+          --output text \
+          --region us-east-1)
+        
+        RDS_PORT=$(aws rds describe-db-instances \
+          --db-instance-identifier tech-challenge-orders-db \
+          --query 'DBInstances[0].Endpoint.Port' \
+          --output text \
+          --region us-east-1)
+        
+        # Get credentials from GitHub secrets (static parts)
+        DB_USERNAME="${{ secrets.DB_USERNAME }}"
+        DB_PASSWORD="${{ secrets.DB_PASSWORD }}"
+        DB_NAME="${{ secrets.DB_NAME }}"
+        
+        # Verify GitHub secrets are set
+        if [ -z "$DB_USERNAME" ] || [ -z "$DB_PASSWORD" ] || [ -z "$DB_NAME" ]; then
+          echo "❌ Missing required GitHub secrets!"
+          echo "Please set the following secrets in your GitHub repository:"
+          echo "  - DB_USERNAME"
+          echo "  - DB_PASSWORD" 
+          echo "  - DB_NAME"
+          echo ""
+          echo "You can set them by running: ./scripts/setup-github-secrets.sh"
+          exit 1
+        fi
+        
+        echo "✅ All required GitHub secrets are set"
+        
+        # Construct the database URL
+        DATABASE_URL="postgresql://${DB_USERNAME}:${DB_PASSWORD}@${RDS_ENDPOINT}:${RDS_PORT}/${DB_NAME}"
+        
+        echo "database_url=$DATABASE_URL" >> $GITHUB_OUTPUT
+        echo "✅ Database URL retrieved dynamically from AWS RDS"
+        echo "Endpoint: $RDS_ENDPOINT"
+        echo "Port: $RDS_PORT"
+        echo "Database: $DB_NAME"
+        
+        # Note: Database connectivity test is skipped because RDS is in private subnets
+        # and GitHub Actions runners are outside the VPC. This is expected behavior.
+        echo "ℹ️  Database connectivity test skipped (RDS is in private subnets)"
+        echo "ℹ️  The migration job will test connectivity from within the EKS cluster"
+        
+    - name: Deploy RabbitMQ
+      run: |
+        echo "🚀 Deploying RabbitMQ..."
+        
+        # Check if RabbitMQ secrets are provided
+        if [ -z "${{ secrets.RABBITMQ_USER }}" ] || [ -z "${{ secrets.RABBITMQ_PASSWORD }}" ]; then
+          echo "❌ Missing RabbitMQ GitHub secrets!"
+          echo "Please set the following secrets in your GitHub repository:"
+          echo "  - RABBITMQ_USER"
+          echo "  - RABBITMQ_PASSWORD"
+          echo ""
+          echo "You can set them by running: ./scripts/setup-github-secrets.sh"
+          exit 1
+        fi
+        
+        # Base64 encode the RabbitMQ credentials
+        RABBITMQ_USER_B64=$(echo -n "${{ secrets.RABBITMQ_USER }}" | base64)
+        RABBITMQ_PASSWORD_B64=$(echo -n "${{ secrets.RABBITMQ_PASSWORD }}" | base64)
+        
+        # Generate RabbitMQ secret with GitHub secrets
+        export RABBITMQ_USER_B64
+        export RABBITMQ_PASSWORD_B64
+        envsubst < k8s/rabbitmq-secret.yaml > k8s/rabbitmq-secret-generated.yaml
+        
+        # Apply RabbitMQ resources
+        kubectl apply -f k8s/rabbitmq-secret-generated.yaml
+        kubectl apply -f k8s/rabbitmq-pvc.yaml
+        kubectl apply -f k8s/rabbitmq-deployment.yaml
+        kubectl apply -f k8s/rabbitmq-service.yaml
+        
+        # Track if we need to use ephemeral storage
+        USE_EPHEMERAL=false
+        
+        # Check available storage classes
+        echo "💿 Checking available storage classes..."
+        kubectl get storageclass || echo "No storage classes found"
+        
+        # Check PVC binding mode and handle accordingly
+        echo "⏳ Checking PVC binding mode..."
+        BINDING_MODE=$(kubectl get storageclass gp2 -o jsonpath='{.volumeBindingMode}' 2>/dev/null || echo "Immediate")
+        echo "Storage class binding mode: $BINDING_MODE"
+        
+        if [ "$BINDING_MODE" = "WaitForFirstConsumer" ]; then
+          echo "ℹ️  Using WaitForFirstConsumer mode - PVC will bind when pod starts"
+          echo "⚠️  WaitForFirstConsumer mode can cause deployment delays, switching to ephemeral storage"
+          echo "🔄 Switching to ephemeral storage deployment..."
+          
+          # Delete the PVC and use ephemeral deployment
+          kubectl delete pvc rabbitmq-pvc -n orders-service --ignore-not-found=true
+          kubectl apply -f k8s/rabbitmq-deployment-ephemeral.yaml
+          USE_EPHEMERAL=true
+          
+          echo "✅ Switched to ephemeral storage deployment"
+        else
+          # Wait for PVC to be bound with better error handling
+          echo "⏳ Waiting for PVC to be bound..."
+          if kubectl wait --for=condition=bound pvc/rabbitmq-pvc -n orders-service --timeout=120s; then
+            echo "✅ PVC bound successfully"
+          else
+            echo "⚠️  PVC binding timed out, checking status..."
+            
+            # Check PVC status
+            PVC_STATUS=$(kubectl get pvc rabbitmq-pvc -n orders-service -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+            echo "PVC Status: $PVC_STATUS"
+            
+            # If PVC is pending, try to diagnose the issue
+            if [ "$PVC_STATUS" = "Pending" ]; then
+              echo "🔍 PVC is pending, checking for issues..."
+              
+              # Check if there are any events related to the PVC
+              echo "📅 Recent PVC events:"
+              kubectl get events -n orders-service --sort-by='.lastTimestamp' | grep -i pvc || echo "No PVC events found"
+              
+              # Check if storage class exists
+              STORAGE_CLASS=$(kubectl get pvc rabbitmq-pvc -n orders-service -o jsonpath='{.spec.storageClassName}' 2>/dev/null || echo "gp2")
+              echo "Storage class: $STORAGE_CLASS"
+              
+              # Try to create a PVC without storage class (use default)
+              echo "🔄 Trying to recreate PVC without specific storage class..."
+              kubectl delete pvc rabbitmq-pvc -n orders-service --ignore-not-found=true
+              
+              # Create PVC without storage class using simple kubectl command
+              kubectl apply -f k8s/rabbitmq-pvc-default.yaml
+              
+              # Wait again
+              if kubectl wait --for=condition=bound pvc/rabbitmq-pvc -n orders-service --timeout=120s; then
+                echo "✅ PVC bound successfully with default storage class"
+              else
+                echo "❌ PVC still not binding, using ephemeral storage..."
+                echo "Note: RabbitMQ will use ephemeral storage (data will be lost on pod restart)"
+                
+                # Delete the PVC and use ephemeral deployment
+                kubectl delete pvc rabbitmq-pvc -n orders-service --ignore-not-found=true
+                kubectl apply -f k8s/rabbitmq-deployment-ephemeral.yaml
+                USE_EPHEMERAL=true
+              fi
+            else
+              echo "❌ PVC binding failed with status: $PVC_STATUS"
+              exit 1
+            fi
+          fi
+        fi
+        
+        # Wait for RabbitMQ deployment to be available
+        echo "⏳ Waiting for RabbitMQ deployment to be available..."
+        if [ "$USE_EPHEMERAL" = "true" ]; then
+          echo "🔄 Using ephemeral storage deployment, waiting for rollout..."
+          kubectl rollout restart deployment/rabbitmq -n orders-service
+        fi
+        
+        # For WaitForFirstConsumer mode, we need to be more patient with deployment
+        if [ "$BINDING_MODE" = "WaitForFirstConsumer" ]; then
+          echo "🔄 Using WaitForFirstConsumer mode - deployment may take longer..."
+          
+          # Show deployment status
+          echo "📋 Current deployment status:"
+          kubectl get deployment rabbitmq -n orders-service
+          
+          # Show any recent events
+          echo "📅 Recent events:"
+          kubectl get events -n orders-service --sort-by='.lastTimestamp' | tail -10
+          
+          kubectl rollout status deployment/rabbitmq -n orders-service --timeout=600s
+        else
+          kubectl wait --for=condition=available deployment/rabbitmq -n orders-service --timeout=300s
+        fi
+        
+        # Wait for RabbitMQ pod to be ready with better debugging
+        echo "⏳ Waiting for RabbitMQ pod to be ready..."
+        
+        # Wait a moment for the rollout to complete and get the new pod name
+        sleep 10
+        
+        # Get the current pod name (after rollout) with retry
+        POD_NAME=""
+        for i in {1..10}; do
+          POD_NAME=$(kubectl get pods -n orders-service -l app=rabbitmq -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          if [ -n "$POD_NAME" ]; then
+            echo "✅ Found RabbitMQ pod: $POD_NAME"
+            break
+          fi
+          echo "⏳ Waiting for RabbitMQ pod to be created (attempt $i/10)..."
+          sleep 5
+        done
+        
+        if [ -z "$POD_NAME" ]; then
+          echo "❌ No RabbitMQ pod found after rollout!"
+          echo "Available pods in orders-service namespace:"
+          kubectl get pods -n orders-service
+          echo "Deployment status:"
+          kubectl get deployment rabbitmq -n orders-service
+          exit 1
+        fi
+        
+        echo "RabbitMQ pod name: $POD_NAME"
+        
+        # Wait for pod to be ready with detailed status checking
+        for i in {1..60}; do
+          echo "Checking RabbitMQ pod status (attempt $i/60)..."
+          
+          # Get pod status
+          POD_STATUS=$(kubectl get pod $POD_NAME -n orders-service -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
+          POD_READY=$(kubectl get pod $POD_NAME -n orders-service -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+          
+          echo "Pod status: $POD_STATUS"
+          echo "Pod ready: $POD_READY"
+          
+          # Check if pod is ready
+          if [ "$POD_READY" = "True" ]; then
+            echo "✅ RabbitMQ pod is ready!"
+            break
+          fi
+          
+          # If pod is in error state, show details
+          if [ "$POD_STATUS" = "Error" ] || [ "$POD_STATUS" = "Failed" ]; then
+            echo "❌ RabbitMQ pod is in error state!"
+            echo "Pod description:"
+            kubectl describe pod $POD_NAME -n orders-service
+            echo "Pod logs:"
+            kubectl logs $POD_NAME -n orders-service || echo "No logs available"
+            exit 1
+          fi
+          
+          # Show recent logs for debugging
+          echo "Recent pod logs:"
+          kubectl logs $POD_NAME -n orders-service --tail=10 || echo "No logs available"
+          
+          # Wait 10 seconds before next check
+          sleep 10
+        done
+        
+        # Final check
+        FINAL_READY=$(kubectl get pod $POD_NAME -n orders-service -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "Unknown")
+        if [ "$FINAL_READY" != "True" ]; then
+          echo "❌ RabbitMQ pod failed to become ready after 10 minutes!"
+          echo "Running debug script..."
+          ./scripts/debug-rabbitmq.sh
+          echo "Final pod description:"
+          kubectl describe pod $POD_NAME -n orders-service
+          echo "Final pod logs:"
+          kubectl logs $POD_NAME -n orders-service || echo "No logs available"
+          exit 1
+        fi
+        
+        echo "✅ RabbitMQ deployed successfully"
+        
+    - name: Create or update Secret
+      run: |
+        # Use the database URL from AWS RDS and RabbitMQ URI with GitHub secrets
+        RABBITMQ_URI="amqp://${{ secrets.RABBITMQ_USER }}:${{ secrets.RABBITMQ_PASSWORD }}@rabbitmq-service.orders-service.svc.cluster.local:5672"
+        
+        # Get external API URLs from LoadBalancer services
+        echo "🔍 Getting external API URLs from LoadBalancer services..."
+        
+        # Get Product API LoadBalancer URL
+        PRODUCT_LB_HOST=$(kubectl get svc products-service-loadbalancer -n products-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        if [ -n "$PRODUCT_LB_HOST" ]; then
+          PRODUCT_API_URL="http://$PRODUCT_LB_HOST:3001"
+          echo "✅ Product API URL: $PRODUCT_API_URL"
+        else
+          echo "⚠️  Product API LoadBalancer not available yet, using fallback URL"
+          PRODUCT_API_URL="http://products-service-loadbalancer.products-service.svc.cluster.local:3001"
+        fi
+        
+        # Get Payment API LoadBalancer URL
+        PAYMENT_LB_HOST=$(kubectl get svc payment-service-loadbalancer -n payment-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+        if [ -n "$PAYMENT_LB_HOST" ]; then
+          PAYMENT_API_URL="http://$PAYMENT_LB_HOST:3003"
+          echo "✅ Payment API URL: $PAYMENT_API_URL"
+        else
+          echo "⚠️  Payment API LoadBalancer not available yet, using fallback URL"
+          PAYMENT_API_URL="http://payment-service-loadbalancer.payment-service.svc.cluster.local:3003"
+        fi
+        
+        kubectl create secret generic tech-order-api-secret \
+          --from-literal=DATABASE_URL="${{ steps.database-url.outputs.database_url }}" \
+          --from-literal=RABBITMQ_URI="$RABBITMQ_URI" \
+          --from-literal=PRODUCT_API_URL="$PRODUCT_API_URL" \
+          --from-literal=PAYMENT_API_URL="$PAYMENT_API_URL" \
+          --namespace=orders-service \
+          --dry-run=client -o yaml | kubectl apply -f -
+        
+    - name: Run database migrations
+      run: |
+        # Clean up any existing migration job first
+        echo "🧹 Cleaning up any existing migration jobs..."
+        kubectl delete job tech-order-api-migration -n orders-service --ignore-not-found=true
+        
+        # Generate migration job
+        export DOCKER_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+        envsubst < k8s/migration-job.yaml > k8s/migration-job-generated.yaml
+        
+        # Apply migration job
+        kubectl apply -f k8s/migration-job-generated.yaml
+        
+        # Wait for migration job to complete with better error handling
+        echo "Waiting for migration job to complete..."
+        
+        # First, try using kubectl wait with the correct condition
+        if kubectl wait --for=condition=complete job/tech-order-api-migration -n orders-service --timeout=300s 2>/dev/null; then
+          echo "✅ Migration job completed successfully using kubectl wait!"
+        else
+          echo "kubectl wait timed out, checking job status manually..."
+          
+          # Alternative: Check if job has succeeded by looking at completion status
+          JOB_SUCCEEDED_COUNT=$(kubectl get job tech-order-api-migration -n orders-service -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "0")
+          if [ "$JOB_SUCCEEDED_COUNT" = "1" ]; then
+            echo "✅ Migration job completed successfully (succeeded count: $JOB_SUCCEEDED_COUNT)!"
+          else
+            echo "Job not completed yet, checking status manually..."
+            
+            # Check job status every 10 seconds for up to 5 minutes
+            for i in {1..30}; do
+              echo "Checking migration job status (attempt $i/30)..."
+              
+              # Get job status - check for both Complete and Succeeded conditions
+              JOB_COMPLETE=$(kubectl get job tech-order-api-migration -n orders-service -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || echo "Unknown")
+              JOB_SUCCEEDED=$(kubectl get job tech-order-api-migration -n orders-service -o jsonpath='{.status.conditions[?(@.type=="Succeeded")].status}' 2>/dev/null || echo "Unknown")
+              JOB_FAILED=$(kubectl get job tech-order-api-migration -n orders-service -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || echo "Unknown")
+              
+              echo "Job Complete status: $JOB_COMPLETE"
+              echo "Job Succeeded status: $JOB_SUCCEEDED"
+              echo "Job Failed status: $JOB_FAILED"
+              
+              # Get pod logs if job is running
+              POD_NAME=$(kubectl get pods -n orders-service -l job-name=tech-order-api-migration -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+              if [ -n "$POD_NAME" ]; then
+                echo "Pod name: $POD_NAME"
+                echo "Pod status: $(kubectl get pod $POD_NAME -n orders-service -o jsonpath='{.status.phase}')"
+                echo "Recent logs:"
+                kubectl logs $POD_NAME -n orders-service --tail=20 || echo "No logs available"
+              fi
+              
+              # Check if job completed successfully
+              if [ "$JOB_COMPLETE" = "True" ] || [ "$JOB_SUCCEEDED" = "True" ]; then
+                echo "✅ Migration job completed successfully!"
+                break
+              elif [ "$JOB_FAILED" = "True" ]; then
+                echo "❌ Migration job failed!"
+                echo "Full job description:"
+                kubectl describe job tech-order-api-migration -n orders-service
+                echo "Pod logs:"
+                kubectl logs $POD_NAME -n orders-service || echo "No logs available"
+                exit 1
+              fi
+              
+              # Alternative check: look at succeeded count
+              JOB_SUCCEEDED_COUNT=$(kubectl get job tech-order-api-migration -n orders-service -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "0")
+              if [ "$JOB_SUCCEEDED_COUNT" = "1" ]; then
+                echo "✅ Migration job completed successfully (succeeded count: $JOB_SUCCEEDED_COUNT)!"
+                break
+              fi
+                
+              # Wait 10 seconds before next check
+              sleep 10
+            done
+            
+            # Final check
+            if [ "$JOB_COMPLETE" != "True" ] && [ "$JOB_SUCCEEDED" != "True" ]; then
+              echo "❌ Migration job timed out after 5 minutes!"
+              echo "Job description:"
+              kubectl describe job tech-order-api-migration -n orders-service
+              echo "Pod logs:"
+              kubectl logs $POD_NAME -n orders-service || echo "No logs available"
+              exit 1
+            fi
+          fi
+        fi
+        
+        # Clean up migration job
+        kubectl delete -f k8s/migration-job-generated.yaml
+        
+    - name: Deploy to Kubernetes
+      run: |
+        # Generate Kubernetes manifests
+        envsubst < k8s/deployment.yaml.template > k8s/deployment.yaml
+        envsubst < k8s/service.yaml.template > k8s/service.yaml
+        
+        # Apply manifests
+        kubectl apply -f k8s/namespace.yaml
+        kubectl apply -f k8s/configmap.yaml
+        kubectl apply -f k8s/deployment.yaml
+        kubectl apply -f k8s/service.yaml
+        kubectl apply -f k8s/hpa.yaml
+        
+        # Wait for deployment to be ready
+        kubectl rollout status deployment/tech-order-api -n orders-service --timeout=300s
+      env:
+        DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        SERVICE_NAME: tech-order-api
+        SERVICE_PORT: "3000"
+        NAMESPACE: orders-service
+        DOMAIN_NAME: tech-challenge.local 

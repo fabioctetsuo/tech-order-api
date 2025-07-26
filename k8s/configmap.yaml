@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tech-order-api-config
+  namespace: orders-service
+data:
+  NODE_ENV: "production"
+  SERVICE_PORT: "3000"
+  # External service URLs will be provided via Secret
+  # PRODUCT_API_URL will be provided via Secret
+  # PAYMENT_API_URL will be provided via Secret
+  # DATABASE_URL will be provided via Secret
+  # RABBITMQ_URI will be provided via Secret 

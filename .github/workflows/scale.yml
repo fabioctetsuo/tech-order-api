@@ -1,0 +1,95 @@
+name: Scale Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        default: 'orders-service'
+        type: string
+      deployment_name:
+        description: 'Deployment name to scale'
+        required: true
+        default: 'tech-order-api'
+        type: string
+      replicas:
+        description: 'Number of replicas'
+        required: true
+        default: '2'
+        type: string
+      rabbitmq_replicas:
+        description: 'Number of RabbitMQ replicas (optional)'
+        required: false
+        type: string
+
+jobs:
+  scale:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+        aws-region: us-east-1
+        
+    - name: Update kube config
+      run: aws eks update-kubeconfig --region us-east-1 --name tech_challenge_cluster
+      
+    - name: Show current deployment status
+      run: |
+        echo "📊 Current deployment status:"
+        kubectl get deployment ${{ inputs.deployment_name }} -n ${{ inputs.namespace }} -o wide
+        echo ""
+        echo "🐳 Current pod status:"
+        kubectl get pods -n ${{ inputs.namespace }} -l app=${{ inputs.deployment_name }}
+        
+    - name: Scale Order API deployment
+      run: |
+        echo "📈 Scaling ${{ inputs.deployment_name }} to ${{ inputs.replicas }} replicas..."
+        kubectl scale deployment/${{ inputs.deployment_name }} -n ${{ inputs.namespace }} --replicas=${{ inputs.replicas }}
+        
+    - name: Scale RabbitMQ deployment (if specified)
+      if: inputs.rabbitmq_replicas != ''
+      run: |
+        echo "📈 Scaling RabbitMQ to ${{ inputs.rabbitmq_replicas }} replicas..."
+        kubectl scale deployment/rabbitmq -n ${{ inputs.namespace }} --replicas=${{ inputs.rabbitmq_replicas }}
+        
+    - name: Wait for scaling to complete
+      run: |
+        echo "⏳ Waiting for scaling to complete..."
+        kubectl rollout status deployment/${{ inputs.deployment_name }} -n ${{ inputs.namespace }} --timeout=300s
+        
+        if [ -n "${{ inputs.rabbitmq_replicas }}" ]; then
+          echo "⏳ Waiting for RabbitMQ scaling to complete..."
+          kubectl rollout status deployment/rabbitmq -n ${{ inputs.namespace }} --timeout=300s
+        fi
+        
+    - name: Show updated status
+      run: |
+        echo "✅ Scaling completed successfully!"
+        echo ""
+        echo "📊 Updated deployment status:"
+        kubectl get deployment ${{ inputs.deployment_name }} -n ${{ inputs.namespace }} -o wide
+        echo ""
+        echo "🐳 Updated pod status:"
+        kubectl get pods -n ${{ inputs.namespace }} -l app=${{ inputs.deployment_name }}
+        
+        if [ -n "${{ inputs.rabbitmq_replicas }}" ]; then
+          echo ""
+          echo "🐰 RabbitMQ deployment status:"
+          kubectl get deployment rabbitmq -n ${{ inputs.namespace }} -o wide
+          echo ""
+          echo "🐰 RabbitMQ pod status:"
+          kubectl get pods -n ${{ inputs.namespace }} -l app=rabbitmq
+        fi
+        
+        echo ""
+        echo "📊 HPA status:"
+        kubectl get hpa -n ${{ inputs.namespace }} 
