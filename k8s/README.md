@@ -50,7 +50,7 @@ k8s/
 | `NODE_ENV` | Node.js environment | `production` |
 | `SERVICE_PORT` | Service port | `3000` |
 | `PRODUCT_API_URL` | Product API service URL | `http://tech-product-api-service.products-service.svc.cluster.local:3001` |
-| `PAYMENT_API_URL` | Payment API service URL | `http://tech-payment-api-service.payments-service.svc.cluster.local:3002` |
+| `PAYMENT_API_URL` | Payment API service URL | `http://tech-payment-api-service.payment-service.svc.cluster.local:3002` |
 
 ## Deployment Steps
 

@@ -76,9 +76,9 @@ jobs:
           namespace: ${{ inputs.namespace }}
         data:
           NODE_ENV: "${{ inputs.environment }}"
-          SERVICE_PORT: "3000"
+          SERVICE_PORT: "3002"
           PRODUCT_API_URL: "http://tech-product-api-service.products-service.svc.cluster.local:3001"
-          PAYMENT_API_URL: "http://tech-payment-api-service.payments-service.svc.cluster.local:3002"
+          PAYMENT_API_URL: "http://tech-payment-api-service.payment-service.svc.cluster.local:3002"
         EOF
         
     - name: Get database URL from AWS RDS

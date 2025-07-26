@@ -499,6 +499,6 @@ jobs:
       env:
         DOCKER_IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
         SERVICE_NAME: tech-order-api
-        SERVICE_PORT: "3000"
+        SERVICE_PORT: "3002"
         NAMESPACE: orders-service
         DOMAIN_NAME: tech-challenge.local 

@@ -38,7 +38,7 @@ COPY --from=builder --chown=nestjs:nodejs /app/prisma ./prisma
 # Switch to non-root user
 USER nestjs
 
-EXPOSE 3000
+EXPOSE 3002
 
 # Use dumb-init to handle signals properly
 ENTRYPOINT ["dumb-init", "--"]

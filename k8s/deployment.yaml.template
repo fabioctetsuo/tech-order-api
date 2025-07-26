@@ -21,7 +21,7 @@ spec:
       - name: tech-order-api
         image: ${DOCKER_IMAGE}
         ports:
-        - containerPort: 3000
+        - containerPort: 3002
         env:
         - name: NODE_ENV
           valueFrom:
@@ -63,7 +63,7 @@ spec:
         livenessProbe:
           httpGet:
             path: /health
-            port: 3000
+            port: 3002
           initialDelaySeconds: 30
           periodSeconds: 10
           timeoutSeconds: 5
@@ -71,7 +71,7 @@ spec:
         readinessProbe:
           httpGet:
             path: /health
-            port: 3000
+            port: 3002
           initialDelaySeconds: 5
           periodSeconds: 5
           timeoutSeconds: 3
