@@ -20,7 +20,7 @@ async function bootstrap() {
 
   const port = process.env.PORT || 3002;
   await app.listen(port);
-  console.log(`Order API running on port ${port}`);
+  console.log(`Order API is running on port ${port}`);
 }
 
 void bootstrap();
