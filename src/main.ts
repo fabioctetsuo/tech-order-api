@@ -23,4 +23,4 @@ async function bootstrap() {
   console.log(`Order API running on port ${port}`);
 }
 
-bootstrap();
+void bootstrap();
