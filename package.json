@@ -24,7 +24,7 @@
     "prisma:studio": "prisma studio"
   },
   "dependencies": {
-    "@aws-sdk/client-secrets-manager": "^3.821.0",
+    "@aws-sdk/client-secrets-manager": "^3.859.0",
     "@golevelup/nestjs-rabbitmq": "^5.7.0",
     "@nestjs/axios": "^4.0.0",
     "@nestjs/common": "^11.0.1",
